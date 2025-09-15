@@ -1,0 +1,2 @@
+AWS IAM (Identity and Access Management) is the security control service that manages who can access AWS resources and what actions they can perform. It is like the security system for your AWS account, ensuring only authorized people and services have the right permissions.
+With IAM, you create users for individuals, groups for managing multiple users, and roles for temporary access or service-to-service authentication. Permissions are managed using policies
