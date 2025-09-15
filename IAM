@@ -8,3 +8,205 @@ Users: IAM users represent individual people or entities (such as applications o
 Groups: IAM groups are collections of users with similar access requirements. Instead of managing permissions for each user individually, you can assign permissions to groups, making it easier to manage access control. Users can be added or removed from groups as needed.
 Roles: IAM roles are used to grant temporary access to AWS resources. Roles are typically used by applications or services that need to access AWS resources on behalf of users or other services. Roles have associated policies that define the permissions and actions allowed for the role.
 Policies: IAM policies are JSON documents that define permissions. Policies specify the actions that can be performed on AWS resources and the resources to which the actions apply. Policies can be attached to users, groups, or roles to control access. IAM provides both AWS managed policies (predefined policies maintained by AWS) and customer managed policies (policies created and managed by you).
+REALTIME  EXAMPLE:
+
+REAL TIME EXAMPLE: We gave Jenkins EC2 instances an IAM role with access to S3 and ECR. This allowed Jenkins to upload build artifacts and Docker images securely without embedding static access keys.  How to achieve this:  What we’re doing (high level)
+1. Create an IAM Role for Jenkins and attach the right policies (S3 + ECR).
+2. Attach that role to the Jenkins EC2 instance using an Instance Profile.
+3. In Jenkins jobs/pipelines, use the AWS CLI (which will automatically pick up the role’s temporary creds from the instance metadata) to:
+    * aws s3 cp artifacts to S3
+    * aws ecr get-login-password → docker login → docker push to ECR
+No access keys in Jenkins. No secrets to rotate. Least-privilege, auditable, and secure.
+  1) Create the IAM Role for the Jenkins EC2
+a) Trust policy (who can assume the role)
+This lets EC2 assume the role:
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Service": "ec2.amazonaws.com" },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+b) Permissions policy (what Jenkins can do)
+S3: limit to one bucket/prefix you use for artifacts. Replace my-artifacts-bucket and jenkins/ with yours.
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "S3Artifacts",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::my-artifacts-bucket/jenkins/*"
+    },
+    {
+      "Sid": "S3ListBucket",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::my-artifacts-bucket",
+      "Condition": {
+        "StringLike": { "s3:prefix": [ "jenkins/*" ] }
+      }
+    },
+    {
+      "Sid": "ECRPushPull",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:GetAuthorizationToken",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:CompleteLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:InitiateLayerUpload",
+        "ecr:PutImage",
+        "ecr:BatchGetImage",
+        "ecr:DescribeRepositories"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+Optional:
+* Add ecr:CreateRepository if your pipeline creates repos on the fly.
+* Scope ECR actions to specific repositories if you want tighter control.
+c) Create an Instance Profile for the role
+When you create a role in the console, you can “create instance profile” or it’s auto-created. Ensure your EC2 instance uses this instance profile.
+
+2) Attach the role to the Jenkins EC2 instance
+* Console → EC2 → Instances → Select Jenkins instance → Actions → Security → Modify IAM role → pick the role.
+* If you use Launch Template/Auto Scaling for Jenkins agents, add the instance profile there.
+Security best practices:
+* Use IMDSv2 (Instance Metadata Service v2) on the instance.
+* Lock S3 buckets with Block Public Access, server-side encryption (SSE-S3 or SSE-KMS).
+* Consider a bucket policy that only allows actions from your role.
+
+3) Use it in Jenkins (no keys needed)
+Because the EC2 has an IAM role, the AWS SDK/CLI in Jenkins will auto-detect credentials from the instance metadata.
+a) Push artifacts to S3 (Declarative Jenkinsfile snippet)
+
+pipeline {
+  agent any
+  environment {
+    AWS_REGION = 'us-east-1'
+    ARTIFACT_DIR = 'dist/'
+    S3_BUCKET = 'my-artifacts-bucket'
+    S3_PREFIX = 'jenkins/myapp/${env.BUILD_NUMBER}/'
+  }
+  stages {
+    stage('Build') {
+      steps {
+        sh 'mkdir -p dist && echo "hello" > dist/app.txt'
+      }
+    }
+    stage('Upload Artifacts to S3') {
+      steps {
+        sh '''
+          aws s3 cp "${ARTIFACT_DIR}" "s3://${S3_BUCKET}/${S3_PREFIX}" --recursive --region ${AWS_REGION}
+        '''
+      }
+    }
+  }
+}
+b) Build and push Docker image to ECR
+Prep (one time): create ECR repo myapp and note your AWS account ID and region.
+Jenkinsfile snippet:
+
+pipeline {
+  agent any
+  environment {
+    AWS_REGION   = 'us-east-1'
+    AWS_ACCOUNT  = '123456789012'
+    ECR_REPO     = 'myapp'
+    IMAGE_TAG    = "${env.BUILD_NUMBER}"
+    ECR_URI      = "${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+  }
+  stages {
+    stage('Docker Build') {
+      steps {
+        sh '''
+          docker build -t ${ECR_REPO}:${IMAGE_TAG} .
+          docker tag ${ECR_REPO}:${IMAGE_TAG} ${ECR_URI}:${IMAGE_TAG}
+        '''
+      }
+    }
+    stage('ECR Login & Push') {
+      steps {
+        sh '''
+          aws ecr get-login-password --region ${AWS_REGION} \
+          | docker login --username AWS --password-stdin ${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com
+
+          docker push ${ECR_URI}:${IMAGE_TAG}
+        '''
+      }
+    }
+  }
+}
+That’s it—no access keys in Jenkins. The AWS CLI gets temporary creds from the role.
+
+Optional: Cross-account pushes (if ECR/S3 are in a different AWS account)
+* In Account A (Jenkins): allow the Jenkins role to assume a target role in Account B:
+    * Add sts:AssumeRole on the Jenkins role’s policy (Resource: target role ARN).
+* In Account B (Target): create a role with ECR/S3 permissions, and set its trust policy to allow assumption by Jenkins role’s ARN from Account A.
+* In pipeline, do:
+
+ASSUMED=$(aws sts assume-role \
+  --role-arn arn:aws:iam::999999999999:role/TargetPushRole \
+  --role-session-name jenkins-push \
+  --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+  --output text)
+
+AWS_ACCESS_KEY_ID=$(echo "$ASSUMED" | awk '{print $1}')
+AWS_SECRET_ACCESS_KEY=$(echo "$ASSUMED" | awk '{print $2}')
+AWS_SESSION_TOKEN=$(echo "$ASSUMED" | awk '{print $3}')
+
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+# Then same ECR login/push or S3 cp commands
+
+Common pitfalls & fixes
+* “AccessDenied” pushing to ECR → Missing one of the ecr:* actions (especially GetAuthorizationToken, InitiateLayerUpload, UploadLayerPart, CompleteLayerUpload, PutImage).
+* S3 upload blocked → Bucket policy denies your role or wrong bucket/prefix in the policy.
+* Jenkins inside a Docker container on the EC2 host → Ensure the container can reach the IMDSv2 endpoint (or mount host’s credentials via /var/lib/jenkins/.aws/credentials only if needed; preferred is allowing container to use host role or move Jenkins to ECS with a task role).
+* Wrong region → ECR is regional; aws ecr and docker login must use the same region as the repo.
+* Leftover costs → Clean up unattached EBS volumes; add S3 lifecycle rules; add ECR lifecycle policy to expire old images.
+
+Terraform (optional—IaC example for the role)
+
+resource "aws_iam_role" "jenkins_ec2_role" {
+  name = "jenkins-ec2-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Principal = { Service = "ec2.amazonaws.com" },
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "jenkins_permissions" {
+  name = "jenkins-permissions"
+  role = aws_iam_role.jenkins_ec2_role.id
+  policy = file("jenkins-permissions.json") # put the S3/ECR JSON from above here
+}
+
+resource "aws_iam_instance_profile" "jenkins_profile" {
+  name = "jenkins-instance-profile"
+  role = aws_iam_role.jenkins_ec2_role.name
+}
+Attach aws_iam_instance_profile.jenkins_profile.name to your Jenkins EC2 (or in your Launch Template/ASG).
+
+TL;DR
+* Give Jenkins EC2 an IAM role with least-privilege S3/ECR permissions.
+* Attach role via instance profile.
+* Use AWS CLI in pipelines—no static keys required.
+* Profit: simpler security, fewer secrets, easier audits.
+If you want, share your bucket name, ECR repo names, and region, and I’ll tailor the exact policy JSON and Jenkinsfile to your setup.
+
